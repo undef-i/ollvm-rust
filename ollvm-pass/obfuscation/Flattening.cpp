@@ -17,6 +17,8 @@
 #include "include/Utils.h"
 #include "include/CryptoUtils.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/IR/Verifier.h" 
+#include "llvm/IR/IRBuilder.h"
 
 #define DEBUG_TYPE "flattening"
 
@@ -78,10 +80,6 @@ bool Flattening::flatten(Function *f) {
   char scrambling_key[16];
   llvm::cryptoutils->get_bytes(scrambling_key, 16);
   // END OF SCRAMBLER
-
-  // Lower switch
-  FunctionPass *lower = createLegacyLowerSwitchPass();
-  lower->runOnFunction(*f);
 
   // Save all original BB
   for (Function::iterator i = f->begin(); i != f->end(); ++i) {
@@ -193,8 +191,8 @@ bool Flattening::flatten(Function *f) {
           llvm::cryptoutils->scramble64(switchI->getNumCases(), scrambling_key)));
     } else {
       numCase = cast<ConstantInt>(ConstantInt::get(
-        switchI->getCondition()->getType(),
-        llvm::cryptoutils->scramble32(switchI->getNumCases(), scrambling_key)));
+      switchI->getCondition()->getType(),
+      llvm::cryptoutils->scramble32(switchI->getNumCases(), scrambling_key)));
     }
     switchI->addCase(numCase, i);
   }
@@ -238,11 +236,13 @@ bool Flattening::flatten(Function *f) {
       // numCase = MySecret - (MySecret - numCase)
       // X = MySecret - numCase
       Constant *X = ConstantExpr::getSub(Zero, numCase);
-      Value *newNumCase = BinaryOperator::Create(Instruction::Sub, MySecret, X, "", i);
+      
+      IRBuilder<> builder(i);
+      Value *newNumCase = builder.CreateSub(MySecret, X);
 
       // Update switchVar and jump to the end of loop
-      new StoreInst(newNumCase, load->getPointerOperand(), i);
-      BranchInst::Create(loopEnd, i);
+      builder.CreateStore(newNumCase, load->getPointerOperand());
+      builder.CreateBr(loopEnd);
       continue;
     }
 
@@ -282,33 +282,29 @@ bool Flattening::flatten(Function *f) {
                 switchI->getNumCases() - 1, scrambling_key)));
         }
       }
-
-      Constant *X, *Y;
-      X = ConstantExpr::getSub(Zero, numCaseTrue);
-      Y = ConstantExpr::getSub(Zero, numCaseFalse);
-      Value *newNumCaseTrue = BinaryOperator::Create(Instruction::Sub, MySecret, X, "", i->getTerminator());
-      Value *newNumCaseFalse = BinaryOperator::Create(Instruction::Sub, MySecret, Y, "", i->getTerminator());
-
-      // Create a SelectInst
+      
       BranchInst *br = cast<BranchInst>(i->getTerminator());
-      SelectInst *sel =
-          SelectInst::Create(br->getCondition(), newNumCaseTrue, newNumCaseFalse, "",
-                             i->getTerminator());
+      Value *condition = br->getCondition();
 
-      // Erase terminator
       i->getTerminator()->eraseFromParent();
 
-      // Update switchVar and jump to the end of loop
-      new StoreInst(sel, load->getPointerOperand(), i);
-      BranchInst::Create(loopEnd, i);
+      IRBuilder<> builder(i);
+      Constant *X = ConstantExpr::getSub(Zero, numCaseTrue);
+      Constant *Y = ConstantExpr::getSub(Zero, numCaseFalse);
+      Value *newNumCaseTrue = builder.CreateSub(MySecret, X);
+      Value *newNumCaseFalse = builder.CreateSub(MySecret, Y);
+      Value *sel = builder.CreateSelect(condition, newNumCaseTrue, newNumCaseFalse);
+      builder.CreateStore(sel, load->getPointerOperand());
+      builder.CreateBr(loopEnd);
       continue;
     }
   }
 
-  fixStack(f);
+  // fixStack(f); 
 
-  lower->runOnFunction(*f);
-  delete(lower);
+  if (verifyFunction(*f, &errs())) {
+    errs() << "Error: Flattening pass generated invalid IR!\n";
+  }
 
   return true;
 }

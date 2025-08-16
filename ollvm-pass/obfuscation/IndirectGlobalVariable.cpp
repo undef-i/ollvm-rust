@@ -6,6 +6,7 @@
 #include "include/Utils.h"
 #include "include/CryptoUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/IR/Module.h"
 
 #define DEBUG_TYPE "indgv"
 

@@ -1,76 +1,57 @@
 # ollvm-pass
 
-Out-of-tree llvm obfuscation pass，可在编译时对二进制进行混淆，通过 rustc/opt 动态加载使用，无需重新编译 llvm 和 rustc，支持以下混淆方式：
+基于 [0xlane/ollvm-rust](https://github.com/0xlane/ollvm-rust) 修改，适配 LLVM 21 的 LLVM 混淆插件。通过 `rustc` 或 `opt` 动态加载，无需重新编译 LLVM/Rust。
 
-- 间接跳转,并加密跳转目标(-irobf-indbr)
-- 间接函数调用,并加密目标函数地址(-irobf-icall)
-- 间接全局变量引用,并加密变量地址(-irobf-indgv)
-- 字符串(c string)加密功能(-irobf-cse) （rust 中不生效，已知问题）
-- 过程相关控制流平坦混淆(-irobf-cff)
-- 全部 (-irobf-indbr -irobf-icall -irobf-indgv -irobf-cse -irobf-cff)
+## 功能
 
-混淆插件提取自 [Arkari](https://github.com/KomiMoe/Arkari) 项目。
+支持以下混淆方式：
+- **间接跳转** (`-irobf-indbr`)：加密跳转目标地址。
+- **间接函数调用** (`-irobf-icall`)：加密目标函数地址。
+- **间接全局变量引用** (`-irobf-indgv`)：加密全局变量地址。
+- **字符串加密** (`-irobf-cse`)：加密 C 风格字符串（Rust 中不生效，已知问题）。
+- **控制流平坦化** (`-irobf-cff`)：平坦化控制流（未修复）。
+- **全部混淆**：组合以上方式。
 
-> 注意：该项目当前仅在 windows x86 下测试，其他平台未测试
+**注意**：仅在 GNU/Linux 测试，其他平台未验证。
 
-![effect.png](assets/effect.png)
+## 安装
 
-## rust 动态加载
+1. 安装 LLVM 21 和 `clang-21`、`clang++-21`。
+2. 编译插件：
+   ```bash
+   cmake -G "Ninja" -S . -B build \
+         -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_C_COMPILER=clang-21 \
+         -DCMAKE_CXX_COMPILER=clang++-21 \
+         -DLLVM_DIR=/usr/lib/llvm-21/cmake
+   cmake --build build -j $(nproc)
+   ```
 
-动态加载 llvm pass 插件需切换到 nightly 通道（[Allow loading of LLVM plugins [when dynamically built rust]](https://github.com/rust-lang/rust/pull/82734)）：
+## 使用
 
+### Rust 动态加载
+需要 Rust nightly 工具链：
 ```bash
 rustup toolchain install nightly
-```
-
-生成一个示例项目，通过 `-Zllvm-plugins` 参数加载 pass 插件，并通过 `-Cpasses` 参数指定混淆开关：
-
-```bash
 cargo new helloworld --bin
 cd helloworld
 cargo +nightly rustc --target x86_64-pc-windows-msvc --release -- -Zllvm-plugins="/path/to/LLVMObfuscationx.dll" -Cpasses="irobf(irobf-indbr,irobf-icall,irobf-indgv,irobf-cff,irobf-cse)"
 ```
 
-## opt 动态加载
-
+### Opt 动态加载
 ```bash
-# 使用 clang 编译源代码并生成 IR
 clang -emit-llvm -c input.c -o input.bc
-
-# 使用 opt 工具加载和运行自定义 Pass
-opt -load-pass-plugin="/path/to/LLVMObfuscationx.dll" --passes="irobf(irobf-indbr,irobf-icall,irobf-indgv,irobf-cff,irobf-cse)" input.bc -o output.bc
-
-# 将 IR 文件编译为目标文件
+opt -load-pass-plugin="/path/to/LLVMObfuscationx.so" --passes="irobf(irobf-indbr,irobf-icall,irobf-indgv,irobf-cff,irobf-cse)" input.bc -o output.bc
 llc -filetype=obj output.bc -o output.o
-
-# 链接目标文件生成可执行文件
 clang output.o -o output.exe
 ```
 
-## x86 msvc pass 编译方法
-
-### 环境
-
-- Windows 11 (10.0.22631.3737)
-- Visual Studio 2022 (17.10.3)
-  - 使用 C++ 的桌面开发
-- LLVM 18.1.5
-
-### 编译
-
-需在 `x64 Native Tools Command Prompt for VS 2022` 环境中执行，从开始菜单或者执行 `cmd.exe /k "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" -startdir=none -arch=x64 -host_arch=x64` 进入：
-
-```bash
-git clone --branch ollvm-pass https://github.com/0xlane/ollvm-rust.git
-cd ollvm-rust
-cmake -G "Ninja" -S .\ollvm-pass -B .\build -DCMAKE_CXX_STANDARD=17 -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DLT_LLVM_INSTALL_DIR=D:\dev\rust_ollvm\llvm-build\llvm_x64
-cmake --build .\build\ -j12 # change 12 to yourself nproc
-```
-
-> `LT_LLVM_INSTALL_DIR` 需指定为自己的 LLVM 安装路径
+## 已知问题
+- 字符串加密 (`-irobf-cse`) 在 Rust 中不生效（[参考](https://github.com/joaovarelas/Obfuscator-LLVM-16.0/issues/8)）。
+- 控制流平坦化 (`-irobf-cff`) 未修复。
+- 仅 GNU/Linux 测试，Windows/macOS 未验证。
 
 ## 参考
-
 - [Allow loading of LLVM plugins [when dynamically built rust]](https://github.com/rust-lang/rust/pull/82734)
 - [Installing from Source](https://github.com/rust-lang/rust/blob/master/INSTALL.md)
 - [rustc dev guide](https://rustc-dev-guide.rust-lang.org/building/how-to-build-and-run.html)
@@ -79,7 +60,5 @@ cmake --build .\build\ -j12 # change 12 to yourself nproc
 - [Building LLVM with CMake](https://llvm.org/docs/CMake.html#developing-llvm-passes-out-of-source)
 - [llvm-tutor](https://github.com/banach-space/llvm-tutor)
 - [String encryption failed](https://github.com/joaovarelas/Obfuscator-LLVM-16.0/issues/8)
-
-## 感谢
-
-- [Arkari](https://github.com/KomiMoe/Arkari)
+## 致谢
+- [Arkari](https://github.com/KomiMoe/Arkari)：原始项目。

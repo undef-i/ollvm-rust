@@ -7,6 +7,7 @@
 #include "include/CryptoUtils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/IR/Module.h"
 
 #include <random>
 

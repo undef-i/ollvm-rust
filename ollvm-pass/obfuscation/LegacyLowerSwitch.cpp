@@ -97,7 +97,7 @@ namespace {
                               Value *Val, BasicBlock *Predecessor,
                               BasicBlock *OrigBlock, BasicBlock *Default,
                               const std::vector<IntRange> &UnreachableRanges);
-    BasicBlock *newLeafBlock(CaseRange &Leaf, Value *Val, BasicBlock *OrigBlock,
+BasicBlock *newLeafBlock(CaseRange &Leaf, Value *Val, BasicBlock *OrigBlock,
                              BasicBlock *Default);
     unsigned Clusterify(CaseVector &Cases, SwitchInst *SI);
   };
@@ -315,17 +315,17 @@ BasicBlock* LowerSwitch::newLeafBlock(CaseRange& Leaf, Value* Val,
   ICmpInst* Comp;
   if (Leaf.Low == Leaf.High) {
     // Make the seteq instruction...
-    Comp = new ICmpInst(*NewLeaf, ICmpInst::ICMP_EQ, Val,
+    Comp = new ICmpInst(NewLeaf->getTerminator(), ICmpInst::ICMP_EQ, Val,
                         Leaf.Low, "SwitchLeaf");
   } else {
     // Make range comparison
     if (Leaf.Low->isMinValue(true /*isSigned*/)) {
       // Val >= Min && Val <= Hi --> Val <= Hi
-      Comp = new ICmpInst(*NewLeaf, ICmpInst::ICMP_SLE, Val, Leaf.High,
+      Comp = new ICmpInst(NewLeaf->getTerminator(), ICmpInst::ICMP_SLE, Val, Leaf.High,
                           "SwitchLeaf");
     } else if (Leaf.Low->isZero()) {
       // Val >= 0 && Val <= Hi --> Val <=u Hi
-      Comp = new ICmpInst(*NewLeaf, ICmpInst::ICMP_ULE, Val, Leaf.High,
+      Comp = new ICmpInst(NewLeaf->getTerminator(), ICmpInst::ICMP_ULE, Val, Leaf.High,
                           "SwitchLeaf");
     } else {
       // Emit V-Lo <=u Hi-Lo
@@ -334,7 +334,7 @@ BasicBlock* LowerSwitch::newLeafBlock(CaseRange& Leaf, Value* Val,
                                                    Val->getName()+".off",
                                                    NewLeaf);
       Constant *UpperBound = ConstantExpr::getAdd(NegLo, Leaf.High);
-      Comp = new ICmpInst(*NewLeaf, ICmpInst::ICMP_ULE, Add, UpperBound,
+      Comp = new ICmpInst(NewLeaf->getTerminator(), ICmpInst::ICMP_ULE, Add, UpperBound,
                           "SwitchLeaf");
     }
   }

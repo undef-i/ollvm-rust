@@ -15,7 +15,7 @@
 // Author(s): jrinaldini, pjunod
 //
 //===----------------------------------------------------------------------===//
-
+#include <fstream> 
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
