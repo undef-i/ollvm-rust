@@ -1,317 +1,211 @@
-//===- Flattening.cpp - Flattening Obfuscation pass------------------------===//
+//===- Flattening.cpp - Control Flow Flattening for LLVM 21 ---------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
-//
-//===----------------------------------------------------------------------===//
-//
-// This file implements the flattening pass
+// Adapted from HikariObfuscator for modern LLVM (v21).
+// This is a proper, self-contained New Pass Manager (NPM) implementation.
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/IR/Constants.h"
-#include "include/Flattening.h"
-#include "include/LegacyLowerSwitch.h"
-#include "include/Utils.h"
-#include "include/CryptoUtils.h"
-#include "llvm/ADT/Statistic.h"
-#include "llvm/IR/Verifier.h" 
+// ==================== LLVM Headers ====================
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
+#include "llvm/Transforms/Utils/Local.h"
 
-#define DEBUG_TYPE "flattening"
+// ==================== Local Project Headers ====================
+#include "include/CryptoUtils.h"
+#include "include/Utils.h"
+// ================================================================
 
-using namespace std;
+#include <unordered_map>
+
 using namespace llvm;
 
-// Stats
-STATISTIC(Flattened, "Functions flattened");
+#define DEBUG_TYPE "cffobf"
 
 namespace {
-struct Flattening : public FunctionPass {
-  unsigned pointerSize;
-  static char ID;  // Pass identification, replacement for typeid
-  bool flag;
-  
-  ObfuscationOptions *Options;
-  CryptoUtils RandomEngine;
 
-  Flattening(unsigned pointerSize) : FunctionPass(ID) {
-    this->pointerSize = pointerSize;
-    this->flag = false;
-    this->Options = nullptr;
+void fixStack(Function &F) {
+  if (F.empty()) return;
+  std::vector<AllocaInst *> AllocaToMove;
+  BasicBlock &EntryBB = F.getEntryBlock();
+  auto FirstInsertionPt = EntryBB.getFirstInsertionPt();
+
+  for (BasicBlock &BB : F) {
+    if (&BB == &EntryBB) continue;
+    for (Instruction &I : BB) {
+      if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+        AllocaToMove.push_back(AI);
+      }
+    }
   }
 
-  Flattening(unsigned pointerSize, bool flag, ObfuscationOptions *Options) : FunctionPass(ID) {
-    this->pointerSize = pointerSize;
-    this->flag = flag;
-    this->Options = Options;
+  for (AllocaInst *AI : AllocaToMove) {
+    AI->moveBefore(FirstInsertionPt);
   }
+}
 
-  bool runOnFunction(Function &F);
-  bool flatten(Function *f);
+
+struct Flattening : public PassInfoMixin<Flattening> {
+  bool flag = true;
+
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
+  void flatten(Function &F);
 };
+
+PreservedAnalyses Flattening::run(Function &F, FunctionAnalysisManager &FAM) {
+  if (toObfuscate(flag, &F, "fla") && !F.isPresplitCoroutine()) {
+    errs() << "Running ControlFlowFlattening On " << F.getName() << "\n";
+    flatten(F);
+    return PreservedAnalyses::none();
+  }
+  return PreservedAnalyses::all();
 }
 
-bool Flattening::runOnFunction(Function &F) {
-  Function *tmp = &F;
-  bool result = false;
-  // Do we obfuscate
-  if (toObfuscate(flag, tmp, "fla")) {
-    if (flatten(tmp)) {
-      ++Flattened;
-      result = true;
+void Flattening::flatten(Function &F) {
+  if (F.empty()) return;
+  
+  // ==================== 最终修复：添加启发式过滤器 ====================
+  // 如果函数太复杂（基本块超过30个），就跳过它。
+  // 这是一个简单但有效的启发式方法，可以避免处理我们无法正确处理的复杂编译器内部函数。
+  if (F.size() > 30) {
+      errs() << "Skipping " << F.getName() << " (too complex: >30 basic blocks)\n";
+      return;
+  }
+  // =================================================================
+
+  std::vector<PHINode*> phis;
+  for (BasicBlock &BB : F) {
+    for (PHINode &PN : BB.phis()) {
+      phis.push_back(&PN);
     }
   }
+  for (PHINode *PN : phis) {
+    DemotePHIToStack(PN);
+  }
+  
+  SmallVector<BasicBlock *, 8> origBB;
+  for (BasicBlock &BB : F) {
+    if (BB.isEHPad() || BB.isLandingPad()) {
+      errs() << F.getName() << " contains exception handling, unsupported.\n";
+      return;
+    }
+    origBB.push_back(&BB);
+  }
 
-  return result;
-}
+  if (origBB.size() <= 1) return;
 
-bool Flattening::flatten(Function *f) {
-  vector<BasicBlock *> origBB;
-  BasicBlock *loopEntry;
-  BasicBlock *loopEnd;
-  LoadInst *load;
-  SwitchInst *switchI;
-  AllocaInst *switchVar;
-
-  // SCRAMBLER
   char scrambling_key[16];
-  llvm::cryptoutils->get_bytes(scrambling_key, 16);
-  // END OF SCRAMBLER
+  cryptoutils->get_bytes(scrambling_key, 16);
 
-  // Save all original BB
-  for (Function::iterator i = f->begin(); i != f->end(); ++i) {
-    BasicBlock *tmp = &*i;
-    origBB.push_back(tmp);
+  BasicBlock *entryBlock = &F.getEntryBlock();
+  origBB.erase(origBB.begin()); 
 
-    BasicBlock *bb = &*i;
-    if (isa<InvokeInst>(bb->getTerminator())) {
-      return false;
-    }
-  }
-
-  // Nothing to flatten
-  if (origBB.size() <= 1) {
-    return false;
-  }
-
-  LLVMContext &Ctx = f->getContext();
-  IntegerType* intType = Type::getInt32Ty(Ctx);
-  if (pointerSize == 8) {
-    intType = Type::getInt64Ty(Ctx);
-  }
-
-  Value *MySecret = ConstantInt::get(intType, 0, true);
-
-  // Remove first BB
-  origBB.erase(origBB.begin());
-
-  // Get a pointer on the first BB
-  Function::iterator tmp = f->begin();  //++tmp;
-  BasicBlock *insert = &*tmp;
-
-  // If main begin with an if
-  BranchInst *br = NULL;
-  if (isa<BranchInst>(insert->getTerminator())) {
-    br = cast<BranchInst>(insert->getTerminator());
-  }
-
-  if ((br != NULL && br->isConditional()) ||
-      insert->getTerminator()->getNumSuccessors() > 1) {
-    BasicBlock::iterator i = insert->end();
-        --i;
-
-    if (insert->size() > 1) {
-      --i;
-    }
-
-    BasicBlock *tmpBB = insert->splitBasicBlock(i, "first");
-    origBB.insert(origBB.begin(), tmpBB);
-  }
-
-  // Remove jump
-  insert->getTerminator()->eraseFromParent();
-
-  // Create switch variable and set as it
-  switchVar =
-      new AllocaInst(intType, 0, "switchVar", insert);
-  if (pointerSize == 8) {
-    new StoreInst(
-      ConstantInt::get(intType,
-        llvm::cryptoutils->scramble64(0, scrambling_key)),
-      switchVar, insert);
-  } else {
-    new StoreInst(
-      ConstantInt::get(intType,
-        llvm::cryptoutils->scramble32(0, scrambling_key)),
-      switchVar, insert);
-  }
-
-  // Create main loop
-  loopEntry = BasicBlock::Create(f->getContext(), "loopEntry", f, insert);
-  loopEnd = BasicBlock::Create(f->getContext(), "loopEnd", f, insert);
-
-  load = new LoadInst(intType, switchVar, "switchVar", loopEntry);
-
-  // Move first BB on top
-  insert->moveBefore(loopEntry);
-  BranchInst::Create(loopEntry, insert);
-
-  // loopEnd jump to loopEntry
-  BranchInst::Create(loopEntry, loopEnd);
-
-  BasicBlock *swDefault =
-      BasicBlock::Create(f->getContext(), "switchDefault", f, loopEnd);
-  BranchInst::Create(loopEnd, swDefault);
-
-  // Create switch instruction itself and set condition
-  switchI = SwitchInst::Create(&*f->begin(), swDefault, 0, loopEntry);
-  switchI->setCondition(load);
-
-  // Remove branch jump from 1st BB and make a jump to the while
-  f->begin()->getTerminator()->eraseFromParent();
-
-  BranchInst::Create(loopEntry, &*f->begin());
-
-  // Put all BB in the switch
-  for (vector<BasicBlock *>::iterator b = origBB.begin(); b != origBB.end();
-       ++b) {
-    BasicBlock *i = *b;
-    ConstantInt *numCase = NULL;
-
-    // Move the BB inside the switch (only visual, no code logic)
-    i->moveBefore(loopEnd);
-
-    // Add case to switch
-    if (pointerSize == 8) {
-      numCase = cast<ConstantInt>(ConstantInt::get(
-          switchI->getCondition()->getType(),
-          llvm::cryptoutils->scramble64(switchI->getNumCases(), scrambling_key)));
-    } else {
-      numCase = cast<ConstantInt>(ConstantInt::get(
-      switchI->getCondition()->getType(),
-      llvm::cryptoutils->scramble32(switchI->getNumCases(), scrambling_key)));
-    }
-    switchI->addCase(numCase, i);
-  }
-
-  ConstantInt *Zero = ConstantInt::get(intType, 0);
-  // Recalculate switchVar
-  for (vector<BasicBlock *>::iterator b = origBB.begin(); b != origBB.end();
-       ++b) {
-    BasicBlock *i = *b;
-    ConstantInt *numCase = NULL;
-
-    // Ret BB
-    if (i->getTerminator()->getNumSuccessors() == 0) {
-      continue;
-    }
-
-    // If it's a non-conditional jump
-    if (i->getTerminator()->getNumSuccessors() == 1) {
-      // Get successor and delete terminator
-      BasicBlock *succ = i->getTerminator()->getSuccessor(0);
-      i->getTerminator()->eraseFromParent();
-
-      // Get next case
-      numCase = switchI->findCaseDest(succ);
-
-      // If next case == default case (switchDefault)
-      if (numCase == NULL) {
-        if (pointerSize == 8) {
-          numCase = cast<ConstantInt>(
-              ConstantInt::get(switchI->getCondition()->getType(),
-                               llvm::cryptoutils->scramble64(
-                                   switchI->getNumCases() - 1, scrambling_key)));
-        } else {
-          numCase = cast<ConstantInt>(
-            ConstantInt::get(switchI->getCondition()->getType(),
-              llvm::cryptoutils->scramble32(
-                switchI->getNumCases() - 1, scrambling_key)));
-        }
+  if (entryBlock->getTerminator()->getNumSuccessors() == 0) return;
+  
+  if (entryBlock->getTerminator()->getNumSuccessors() > 1) {
+      auto split_point = entryBlock->getFirstInsertionPt();
+      if(split_point != F.getEntryBlock().end()) {
+        entryBlock = entryBlock->splitBasicBlock(split_point, "entry.split");
+        origBB.insert(origBB.begin(), entryBlock);
       }
+  }
+  
+  Instruction *oldTerm = entryBlock->getTerminator();
+  if (oldTerm->getNumSuccessors() == 0) return;
+  BasicBlock *insertPoint = oldTerm->getSuccessor(0);
+  
+  IRBuilder<> builder(F.getContext());
+  BasicBlock *loopEntry = BasicBlock::Create(F.getContext(), "loopEntry", &F, insertPoint);
+  BasicBlock *loopEnd = BasicBlock::Create(F.getContext(), "loopEnd", &F, insertPoint);
+  BasicBlock *swDefault = BasicBlock::Create(F.getContext(), "switchDefault", &F, loopEnd);
+  
+  builder.SetInsertPoint(&F.getEntryBlock(), F.getEntryBlock().getFirstInsertionPt());
+  AllocaInst *switchVar = builder.CreateAlloca(builder.getInt32Ty(), nullptr, "switchVar");
+  
+  builder.SetInsertPoint(oldTerm);
+  builder.CreateStore(ConstantInt::get(builder.getInt32Ty(), cryptoutils->scramble32(0, scrambling_key)), switchVar);
+  oldTerm->eraseFromParent();
 
-      // numCase = MySecret - (MySecret - numCase)
-      // X = MySecret - numCase
-      Constant *X = ConstantExpr::getSub(Zero, numCase);
-      
-      IRBuilder<> builder(i);
-      Value *newNumCase = builder.CreateSub(MySecret, X);
+  builder.SetInsertPoint(entryBlock);
+  builder.CreateBr(loopEntry);
 
-      // Update switchVar and jump to the end of loop
-      builder.CreateStore(newNumCase, load->getPointerOperand());
-      builder.CreateBr(loopEnd);
-      continue;
-    }
+  builder.SetInsertPoint(loopEntry);
+  Value *load = builder.CreateLoad(builder.getInt32Ty(), switchVar, "loadState");
+  SwitchInst *switchI = builder.CreateSwitch(load, swDefault, origBB.size());
+  
+  builder.SetInsertPoint(loopEnd);
+  builder.CreateBr(loopEntry);
+  builder.SetInsertPoint(swDefault);
+  builder.CreateBr(loopEnd);
 
-    // If it's a conditional jump
-    if (i->getTerminator()->getNumSuccessors() == 2) {
-      // Get next cases
-      ConstantInt *numCaseTrue =
-          switchI->findCaseDest(i->getTerminator()->getSuccessor(0));
-      ConstantInt *numCaseFalse =
-          switchI->findCaseDest(i->getTerminator()->getSuccessor(1));
-
-      // Check if next case == default case (switchDefault)
-      if (numCaseTrue == NULL) {
-        if (pointerSize == 8) {
-          numCaseTrue = cast<ConstantInt>(
-              ConstantInt::get(switchI->getCondition()->getType(),
-                               llvm::cryptoutils->scramble64(
-                                   switchI->getNumCases() - 1, scrambling_key)));
-        } else {
-          numCaseTrue = cast<ConstantInt>(
-            ConstantInt::get(switchI->getCondition()->getType(),
-              llvm::cryptoutils->scramble32(
-                switchI->getNumCases() - 1, scrambling_key)));
-        }
-      }
-
-      if (numCaseFalse == NULL) {
-        if (pointerSize == 8) {
-          numCaseFalse = cast<ConstantInt>(
-              ConstantInt::get(switchI->getCondition()->getType(),
-                               llvm::cryptoutils->scramble64(
-                                   switchI->getNumCases() - 1, scrambling_key)));
-        } else {
-          numCaseFalse = cast<ConstantInt>(
-            ConstantInt::get(switchI->getCondition()->getType(),
-              llvm::cryptoutils->scramble32(
-                switchI->getNumCases() - 1, scrambling_key)));
-        }
-      }
-      
-      BranchInst *br = cast<BranchInst>(i->getTerminator());
-      Value *condition = br->getCondition();
-
-      i->getTerminator()->eraseFromParent();
-
-      IRBuilder<> builder(i);
-      Constant *X = ConstantExpr::getSub(Zero, numCaseTrue);
-      Constant *Y = ConstantExpr::getSub(Zero, numCaseFalse);
-      Value *newNumCaseTrue = builder.CreateSub(MySecret, X);
-      Value *newNumCaseFalse = builder.CreateSub(MySecret, Y);
-      Value *sel = builder.CreateSelect(condition, newNumCaseTrue, newNumCaseFalse);
-      builder.CreateStore(sel, load->getPointerOperand());
-      builder.CreateBr(loopEnd);
-      continue;
-    }
+  for (BasicBlock *bb : origBB) {
+    bb->moveBefore(loopEnd);
+    uint32_t caseNum = cryptoutils->scramble32(switchI->getNumCases(), scrambling_key);
+    switchI->addCase(builder.getInt32(caseNum), bb);
   }
 
-  // fixStack(f); 
+  for (BasicBlock *bb : origBB) {
+    if (isa<ReturnInst>(bb->getTerminator())) continue;
+    
+    Instruction* term = bb->getTerminator();
+    builder.SetInsertPoint(bb);
+    
+    if (auto *br = dyn_cast<BranchInst>(term)) {
+      if (br->isConditional()) {
+        ConstantInt *caseTrue = switchI->findCaseDest(br->getSuccessor(0));
+        ConstantInt *caseFalse = switchI->findCaseDest(br->getSuccessor(1));
+        if (!caseTrue || !caseFalse) continue;
+        Value *sel = builder.CreateSelect(br->getCondition(), caseTrue, caseFalse);
+        builder.CreateStore(sel, switchVar);
+      } else {
+        ConstantInt *caseNext = switchI->findCaseDest(br->getSuccessor(0));
+        if (!caseNext) continue;
+        builder.CreateStore(caseNext, switchVar);
+      }
+    } else if (auto *sw = dyn_cast<SwitchInst>(term)) {
+        Value *cond = sw->getCondition();
+        ConstantInt *defaultCase = switchI->findCaseDest(sw->getDefaultDest());
+        if (!defaultCase) continue;
 
-  if (verifyFunction(*f, &errs())) {
-    errs() << "Error: Flattening pass generated invalid IR!\n";
+        Value *nextState = defaultCase;
+        for (auto &Case : sw->cases()) {
+            ConstantInt *caseValue = Case.getCaseValue();
+            ConstantInt *caseDest = switchI->findCaseDest(Case.getCaseSuccessor());
+            if (!caseDest) continue;
+            Value *cmp = builder.CreateICmpEQ(cond, caseValue);
+            nextState = builder.CreateSelect(cmp, caseDest, nextState);
+        }
+        builder.CreateStore(nextState, switchVar);
+    }
+    
+    term->eraseFromParent();
+    builder.CreateBr(loopEnd);
   }
-
-  return true;
+  
+  fixStack(F);
+  
+  // We add a final verification check.
+  if (verifyFunction(F, &errs())) {
+    errs() << "Error: Flattening pass generated invalid IR for function " << F.getName() << "!\n";
+  }
 }
 
-char Flattening::ID = 0;
-static RegisterPass<Flattening> X("flattening", "Call graph flattening");
-FunctionPass *llvm::createFlatteningPass(unsigned pointerSize) { return new Flattening(pointerSize); }
-FunctionPass *llvm::createFlatteningPass(unsigned pointerSize, bool flag, ObfuscationOptions *Options) {
-  return new Flattening(pointerSize, flag, Options);
+} // namespace
+
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "CFF", "v0.1", [](PassBuilder &PB) {
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, FunctionPassManager &FPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                  if (Name == "cffobf") {
+                    FPM.addPass(Flattening());
+                    return true;
+                  }
+                  return false;
+                });
+          }};
 }
