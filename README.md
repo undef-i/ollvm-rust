@@ -9,7 +9,7 @@
 - **间接函数调用** (`-irobf-icall`)：加密目标函数地址。
 - **间接全局变量引用** (`-irobf-indgv`)：加密全局变量地址。
 - **字符串加密** (`-irobf-cse`)：加密 C 风格字符串（Rust 中不生效，已知问题）。
-- **控制流平坦化** (`-irobf-cff`)：平坦化控制流（未修复）。
+- **控制流平坦化** (`-irobf-cff`)：平坦化控制流。
 - **全部混淆**：组合以上方式。
 
 **注意**：仅在 GNU/Linux 测试，其他平台未验证。
@@ -35,15 +35,15 @@
 rustup toolchain install nightly
 cargo new helloworld --bin
 cd helloworld
-cargo +nightly rustc --target x86_64-pc-windows-msvc --release -- -Zllvm-plugins="/path/to/LLVMObfuscationx.dll" -Cpasses="irobf(irobf-indbr,irobf-icall,irobf-indgv,irobf-cff,irobf-cse)"
+ cargo +nightly rustc --release -- -Zllvm-plugins="/path/to/libLLVMObfuscationx.so" -Cpasses="irobf(irobf-indbr,irobf-icall,irobf-indgv,irobf-cse)"
 ```
 
 ### Opt 动态加载
 ```bash
 clang -emit-llvm -c input.c -o input.bc
-opt -load-pass-plugin="/path/to/LLVMObfuscationx.so" --passes="irobf(irobf-indbr,irobf-icall,irobf-indgv,irobf-cff,irobf-cse)" input.bc -o output.bc
+opt -load-pass-plugin="/path/to/LLVMObfuscationx.so" --passes="irobf(irobf-indbr,irobf-icall,irobf-indgv,irobf-cse)" input.bc -o output.bc
 llc -filetype=obj output.bc -o output.o
-clang output.o -o output.exe
+clang output.o -o output
 ```
 
 ## 已知问题
